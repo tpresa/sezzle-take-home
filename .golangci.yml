@@ -1,0 +1,18 @@
+version: "2"
+
+linters:
+  # errcheck, govet, ineffassign, staticcheck, unused
+  default: standard
+  exclusions:
+    presets:
+      # Unchecked deferred Close/Flush and similar standard-library cleanup.
+      - std-error-handling
+    rules:
+      # Test cleanup (db.Close, provider.Shutdown) is best-effort.
+      - path: _test\.go
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
