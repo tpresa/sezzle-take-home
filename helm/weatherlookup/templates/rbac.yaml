@@ -1,0 +1,29 @@
+{{- if .Values.prometheus.podDiscovery.enabled }}
+# Read-only pod access in this namespace, so Prometheus can discover and
+# scrape each replica individually instead of going through the Service.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "weatherlookup.fullname" . }}-prometheus
+  labels:
+    {{- include "weatherlookup.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "weatherlookup.fullname" . }}-prometheus
+  labels:
+    {{- include "weatherlookup.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "weatherlookup.fullname" . }}-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.prometheus.podDiscovery.serviceAccount.name }}
+    namespace: {{ .Values.prometheus.podDiscovery.serviceAccount.namespace }}
+{{- end }}

@@ -202,6 +202,14 @@ kubectl -n weatherlookup rollout status deployment/weatherlookup
 The chart exposes the HTTP service through local NodePort `30080`, so it is
 available at `http://127.0.0.1:30080`.
 
+Set `autoscaling.enabled=true` to add a HorizontalPodAutoscaler (CPU target
+80%, 1–3 replicas). It needs metrics-server, which k3s and Rancher Desktop
+include. Each replica has its own cache, circuit breakers and in-flight limits,
+so concurrent vendor calls are bounded by `maxReplicas × vendor.maxInFlight`.
+Prometheus scrapes every replica individually with a `pod` label; the chart
+grants the `lgtm` service account read-only access to pods in its namespace for
+that discovery.
+
 ## Monitor locally with Grafana LGTM
 
 The repository includes a local observability chart at `helm/observability`.
