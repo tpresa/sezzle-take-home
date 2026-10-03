@@ -100,11 +100,24 @@ readinessProbe:
   timeoutSeconds: 2
   failureThreshold: 3
 
+# Requires metrics-server (bundled with k3s and Rancher Desktop). Each replica
+# has its own cache, circuit breakers and in-flight limits, so concurrent
+# vendor calls are bounded by maxReplicas × vendor.maxInFlight.
 autoscaling:
   enabled: false
   minReplicas: 1
   maxReplicas: 3
   targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+# Grants the Prometheus in helm/observability read-only access to pods in
+# this namespace so it can scrape every replica (see templates/rbac.yaml).
+prometheus:
+  podDiscovery:
+    enabled: true
+    serviceAccount:
+      name: lgtm
+      namespace: observability
 
 nodeSelector: {}
 tolerations: []
