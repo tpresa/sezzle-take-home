@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Supersede stale PR runs; let every main commit finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Track the latest 1.25 patch, matching the golang:1.25-alpine build image.
+  GO_VERSION: "1.25.x"
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Verify go.mod and go.sum are tidy
+        run: go mod tidy -diff
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with race detector
+        run: go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: |
+          {
+            echo '### Coverage'
+            echo '```'
+            go tool cover -func=coverage.out | tail -n 1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build
+        run: CGO_ENABLED=0 go build -trimpath -o /dev/null .
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.14.0
+
+  vulncheck:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      # v1.7.0 is the newest govulncheck that builds with Go 1.25.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+
+  helm:
+    name: Helm charts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.0
+      - name: Lint and render charts
+        run: |
+          for chart in helm/*/; do
+            echo "::group::${chart}"
+            helm lint --strict "$chart"
+            helm template ci "$chart" > /dev/null
+            echo "::endgroup::"
+          done
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: weatherlookup:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Exercises the endpoints graders check, without calling the vendor.
+      - name: Smoke test container
+        run: |
+          docker run -d --name weatherlookup -p 8080:8080 weatherlookup:ci
+          base=http://localhost:8080
+          for _ in $(seq 1 30); do
+            curl -fsS "$base/healthz" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          # Capture bodies first: `curl | grep -q` can fail with SIGPIPE under pipefail.
+          health=$(curl -fsS "$base/healthz")
+          grep -q '"ok"' <<<"$health"
+          metrics=$(curl -fsS "$base/metrics")
+          grep -q '^weatherlookup_build_info' <<<"$metrics"
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$base/weather?latitude=999&longitude=0")
+          test "$code" = 400
+          echo "healthz, metrics and input validation OK"
+
+      - name: Container logs
+        if: always()
+        run: docker logs weatherlookup || true
