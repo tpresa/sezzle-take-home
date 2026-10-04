@@ -148,6 +148,8 @@ that code.
   Fresh cache hits bypass vendor capacity limits and circuit breakers.
 - The server emits JSON request logs, Prometheus metrics, and OpenTelemetry
   spans for HTTP, vendor, and PostgreSQL operations, plus cache metrics.
+  `/metrics` is served by `prometheus/client_golang` and also includes Go
+  runtime (`go_*`) and process (`process_*`) metrics.
   HTTP metric paths come from `Request.Pattern` after the mux dispatches,
   with the optional method/host removed. Wildcard routes retain their template
   (for example `/weather/{location}`), not individual path values. Requests

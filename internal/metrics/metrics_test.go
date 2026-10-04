@@ -4,10 +4,38 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+// httpRequestSeries gathers weatherlookup_http_requests_total, keyed by
+// "METHOD path status".
+func httpRequestSeries(t *testing.T, m *Metrics) map[string]float64 {
+	t.Helper()
+	families, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	series := map[string]float64{}
+	for _, family := range families {
+		if family.GetName() != "weatherlookup_http_requests_total" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			labels := map[string]string{}
+			for _, label := range metric.GetLabel() {
+				labels[label.GetName()] = label.GetValue()
+			}
+			series[labels["method"]+" "+labels["path"]+" "+labels["status"]] = metric.GetCounter().GetValue()
+		}
+	}
+	return series
+}
 
 func TestMetricsMiddlewareAndHandler(t *testing.T) {
 	metricSet := New()
@@ -52,12 +80,13 @@ func TestHTTPLabelsHaveBoundedCardinality(t *testing.T) {
 			handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(method, fmt.Sprintf("/missing/%d", i), nil))
 		}
 	}
-	if len(m.requests) != 2 {
-		t.Fatalf("unmatched paths/methods created %d series, want 2", len(m.requests))
+	series := httpRequestSeries(t, m)
+	if len(series) != 2 {
+		t.Fatalf("unmatched paths/methods created %d series, want 2: %v", len(series), series)
 	}
 	for _, method := range []string{"GET", "OTHER"} {
-		if s := m.requests[key{method: method, path: "unmatched", status: 404}]; s == nil || s.count != 5000 {
-			t.Fatalf("incorrect unmatched series for %s: %+v", method, s)
+		if got := series[method+" unmatched 404"]; got != 5000 {
+			t.Fatalf("unmatched series for %s = %v, want 5000", method, got)
 		}
 	}
 	for _, path := range []string{"/weather", "/v1/weather", "/healthz"} {
@@ -69,13 +98,13 @@ func TestHTTPLabelsHaveBoundedCardinality(t *testing.T) {
 				status = 405
 				label = "unmatched" // ServeMux does not match a pattern on 405.
 			}
-			if m.requests[key{method: method, path: label, status: status}] == nil {
+			if _, ok := httpRequestSeries(t, m)[method+" "+label+" "+strconv.Itoa(status)]; !ok {
 				t.Fatalf("missing known route/method/status: %s %s %d", method, path, status)
 			}
 		}
 	}
-	if len(m.requests) != 9 {
-		t.Fatalf("series = %d, want 9", len(m.requests))
+	if series := httpRequestSeries(t, m); len(series) != 9 {
+		t.Fatalf("series = %d, want 9: %v", len(series), series)
 	}
 	scrape := httptest.NewRecorder()
 	m.ServeHTTP(scrape, httptest.NewRequest("GET", "/metrics", nil))
@@ -106,12 +135,13 @@ func TestMatchedPatternsPreserveRoutesWithoutClientPathValues(t *testing.T) {
 			handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "http://example.com"+path, nil))
 		}
 	}
-	if len(m.requests) != 4 {
-		t.Fatalf("route series = %d, want 4", len(m.requests))
+	series := httpRequestSeries(t, m)
+	if len(series) != 4 {
+		t.Fatalf("route series = %d, want 4: %v", len(series), series)
 	}
 	for path, status := range map[string]int{"/weather/{location}": 200, "/objects/{rest...}": 404, "/assets/": 204, "/hosts/{id}": 200} {
-		if s := m.requests[key{method: "GET", path: path, status: status}]; s == nil || s.count != 1000 {
-			t.Fatalf("incorrect matched pattern series for %s: %+v", path, s)
+		if got := series["GET "+path+" "+strconv.Itoa(status)]; got != 1000 {
+			t.Fatalf("matched pattern series for %s = %v, want 1000", path, got)
 		}
 	}
 }
@@ -131,12 +161,13 @@ func TestMuxRedirectsHaveBoundedLabels(t *testing.T) {
 			}
 		}
 	}
-	if len(m.requests) != 2 {
-		t.Fatalf("redirects created %d series, want 2", len(m.requests))
+	series := httpRequestSeries(t, m)
+	if len(series) != 2 {
+		t.Fatalf("redirects created %d series, want 2: %v", len(series), series)
 	}
 	for method, path := range map[string]string{"GET": "/folders/{id}/", "CONNECT": "unmatched"} {
-		if s := m.requests[key{method: method, path: path, status: 301}]; s == nil || s.count != 1000 {
-			t.Fatalf("incorrect redirect series for %s: %+v", method, s)
+		if got := series[method+" "+path+" 301"]; got != 1000 {
+			t.Fatalf("redirect series for %s = %v, want 1000", method, got)
 		}
 	}
 }
@@ -168,5 +199,39 @@ func TestDomainMetricsAreExposed(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics missing %q:\n%s", want, body)
 		}
+	}
+}
+
+func TestRuntimeAndProcessMetricsAreExposed(t *testing.T) {
+	response := httptest.NewRecorder()
+	New().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := response.Body.String()
+	want := []string{"go_goroutines ", "go_memstats_heap_alloc_bytes ", `weatherlookup_build_info{version="1.0.0"} 1`}
+	if runtime.GOOS == "linux" {
+		want = append(want, "process_resident_memory_bytes ", "process_open_fds ")
+	}
+	for _, sample := range want {
+		if !strings.Contains(body, sample) {
+			t.Fatalf("metrics missing %q", sample)
+		}
+	}
+}
+
+func TestMetricsPassPromlint(t *testing.T) {
+	m := New()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /weather", func(w http.ResponseWriter, _ *http.Request) {})
+	m.Middleware(mux).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/weather", nil))
+	m.CacheLookup("hit")
+	m.VendorRequest("forecast.current", "success", time.Millisecond)
+	m.VendorRetry("forecast.current")
+	m.ResponseLogWrite("success", time.Millisecond)
+
+	problems, err := testutil.GatherAndLint(m.registry)
+	if err != nil {
+		t.Fatalf("lint: %v", err)
+	}
+	for _, problem := range problems {
+		t.Errorf("%s: %s", problem.Metric, problem.Text)
 	}
 }
