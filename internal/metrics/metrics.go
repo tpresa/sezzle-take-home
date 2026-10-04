@@ -1,118 +1,196 @@
-// Package metrics provides the small Prometheus exposition surface used by
-// the service. It intentionally has no third-party runtime dependency.
+// Package metrics exposes the service's Prometheus metrics using
+// client_golang, plus the Go runtime and process collectors.
 package metrics
 
 import (
 	"database/sql"
-	"fmt"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-var histogramBuckets = [...]float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
-
-type key struct {
-	method string
-	path   string
-	status int
-}
-
-type series struct {
-	count        uint64
-	durationSum  float64
-	bucketCounts [len(histogramBuckets)]uint64
-	infCount     uint64
-}
-
-type vendorKey struct {
-	operation string
-	outcome   string
-}
-
-// Metrics records HTTP request metrics and serves them in Prometheus text
-// format. Labels are limited to method, route path, and status code.
+// Metrics records service metrics in its own registry and serves them in
+// Prometheus exposition format. HTTP labels are limited to method, route
+// pattern, and status code.
 type Metrics struct {
-	mu                     sync.Mutex
-	requests               map[key]*series
-	inFlight               int64
-	cacheLookups           map[string]uint64
-	cacheEntries           int
-	cacheEvictions         uint64
-	staleResponses         uint64
-	vendorRequests         map[vendorKey]*series
-	vendorRetries          map[string]uint64
-	responseLogEnqueued    uint64
-	responseLogDropped     uint64
-	responseLogDropReasons map[string]uint64
-	responseLogWrites      map[string]uint64
-	responseLogDurations   series
-	responseLogRetries     uint64
-	responseLogQueueDepth  int
-	dbOpenConnections      int
-	dbInUseConnections     int
-	dbIdleConnections      int
-	dbWaitCount            int64
-	dbWaitDuration         time.Duration
-	retentionDeleted       uint64
-	guards                 guardMetrics
+	registry *prometheus.Registry
+	handler  http.Handler
+
+	httpRequests *prometheus.CounterVec
+	httpDuration *prometheus.HistogramVec
+	httpInFlight prometheus.Gauge
+
+	cacheLookups   *prometheus.CounterVec
+	cacheEntries   prometheus.Gauge
+	cacheEvictions atomic.Uint64
+	staleResponses prometheus.Counter
+
+	vendorRequests *prometheus.CounterVec
+	vendorDuration *prometheus.HistogramVec
+	vendorRetries  *prometheus.CounterVec
+
+	responseLogEnqueued    prometheus.Counter
+	responseLogDropped     prometheus.Counter
+	responseLogDropReasons *prometheus.CounterVec
+	responseLogQueueDepth  prometheus.Gauge
+	responseLogWrites      *prometheus.CounterVec
+	responseLogDuration    prometheus.Histogram
+	responseLogRetries     prometheus.Counter
+	retentionDeleted       prometheus.Counter
+
+	// sql.DBStats are cumulative snapshots, read at scrape time.
+	dbMu    sync.Mutex
+	dbStats sql.DBStats
+
+	guards guardMetrics
 }
 
+// dropReasons is the bounded set of response-log drop reasons.
+var dropReasons = [...]string{"queue_full", "schema_error", "write_failed", "other"}
+
+// New returns metrics backed by a dedicated registry, so multiple instances
+// (for example in tests) never collide on the global default registry.
 func New() *Metrics {
-	return &Metrics{
-		requests:               make(map[key]*series),
-		cacheLookups:           make(map[string]uint64),
-		vendorRequests:         make(map[vendorKey]*series),
-		vendorRetries:          make(map[string]uint64),
-		responseLogWrites:      make(map[string]uint64),
-		responseLogDropReasons: make(map[string]uint64),
+	m := &Metrics{registry: prometheus.NewRegistry()}
+	m.handler = promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{Registry: m.registry})
+	f := promauto.With(m.registry)
+
+	m.httpRequests = f.NewCounterVec(prometheus.CounterOpts{
+		Name: "weatherlookup_http_requests_total",
+		Help: "Total HTTP requests handled by the service.",
+	}, []string{"method", "path", "status"})
+	m.httpDuration = f.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "weatherlookup_http_request_duration_seconds",
+		Help:    "HTTP request duration in seconds.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"method", "path", "status"})
+	m.httpInFlight = f.NewGauge(prometheus.GaugeOpts{
+		Name: "weatherlookup_http_in_flight_requests",
+		Help: "Current number of HTTP requests being handled.",
+	})
+	f.NewGauge(prometheus.GaugeOpts{
+		Name:        "weatherlookup_build_info",
+		Help:        "Build information for the Weather Lookup service.",
+		ConstLabels: prometheus.Labels{"version": "1.0.0"},
+	}).Set(1)
+
+	m.cacheLookups = f.NewCounterVec(prometheus.CounterOpts{
+		Name: "weatherlookup_cache_requests_total",
+		Help: "Cache lookups by result.",
+	}, []string{"result"})
+	m.cacheEntries = f.NewGauge(prometheus.GaugeOpts{
+		Name: "weatherlookup_cache_entries",
+		Help: "Current cache entries.",
+	})
+	f.NewCounterFunc(prometheus.CounterOpts{
+		Name: "weatherlookup_cache_evictions_total",
+		Help: "Cache entries evicted by the capacity limit.",
+	}, func() float64 { return float64(m.cacheEvictions.Load()) })
+	m.staleResponses = f.NewCounter(prometheus.CounterOpts{
+		Name: "weatherlookup_stale_responses_total",
+		Help: "Responses served from expired cache entries.",
+	})
+
+	m.vendorRequests = f.NewCounterVec(prometheus.CounterOpts{
+		Name: "weatherlookup_vendor_requests_total",
+		Help: "Vendor requests by operation and outcome.",
+	}, []string{"operation", "outcome"})
+	m.vendorDuration = f.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "weatherlookup_vendor_request_duration_seconds",
+		Help:    "Vendor request duration.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"operation", "outcome"})
+	m.vendorRetries = f.NewCounterVec(prometheus.CounterOpts{
+		Name: "weatherlookup_vendor_retries_total",
+		Help: "Vendor retry attempts.",
+	}, []string{"operation"})
+
+	m.responseLogEnqueued = f.NewCounter(prometheus.CounterOpts{
+		Name: "weatherlookup_response_log_enqueued_total",
+		Help: "Response records queued for persistence.",
+	})
+	m.responseLogDropped = f.NewCounter(prometheus.CounterOpts{
+		Name: "weatherlookup_response_log_dropped_total",
+		Help: "Response records lost to queue overflow or database failure.",
+	})
+	m.responseLogDropReasons = f.NewCounterVec(prometheus.CounterOpts{
+		Name: "weatherlookup_response_log_dropped_by_reason_total",
+		Help: "Lost response records by bounded reason.",
+	}, []string{"reason"})
+	// Zero series let increase() see the first drop after startup.
+	for _, reason := range dropReasons {
+		m.responseLogDropReasons.WithLabelValues(reason)
 	}
+	m.responseLogQueueDepth = f.NewGauge(prometheus.GaugeOpts{
+		Name: "weatherlookup_response_log_queue_depth",
+		Help: "Current response persistence queue depth.",
+	})
+	m.responseLogWrites = f.NewCounterVec(prometheus.CounterOpts{
+		Name: "weatherlookup_response_log_writes_total",
+		Help: "Response persistence attempts by outcome.",
+	}, []string{"outcome"})
+	// Outcomes from persistence.outcome(); zero series let the write-failure
+	// alert's increase() see the first failure after startup.
+	for _, outcome := range [...]string{"success", "error", "timeout"} {
+		m.responseLogWrites.WithLabelValues(outcome)
+	}
+	m.responseLogDuration = f.NewHistogram(prometheus.HistogramOpts{
+		Name:    "weatherlookup_response_log_write_duration_seconds",
+		Help:    "Response persistence duration.",
+		Buckets: prometheus.DefBuckets,
+	})
+	m.responseLogRetries = f.NewCounter(prometheus.CounterOpts{
+		Name: "weatherlookup_response_log_retries_total",
+		Help: "Response persistence retry attempts.",
+	})
+	m.retentionDeleted = f.NewCounter(prometheus.CounterOpts{
+		Name: "weatherlookup_retention_deleted_total",
+		Help: "Response records removed by retention cleanup.",
+	})
+
+	m.registerDatabasePool(f)
+	m.registerGuards(f)
+
+	m.registry.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
+	return m
 }
 
 func (m *Metrics) CacheLookup(result string) {
-	m.mu.Lock()
-	m.cacheLookups[result]++
-	m.mu.Unlock()
+	m.cacheLookups.WithLabelValues(result).Inc()
 }
 
 func (m *Metrics) CacheStats(entries int, evictions uint64) {
-	m.mu.Lock()
-	m.cacheEntries = entries
-	m.cacheEvictions = evictions
-	m.mu.Unlock()
+	m.cacheEntries.Set(float64(entries))
+	m.cacheEvictions.Store(evictions)
 }
 
 func (m *Metrics) VendorRequest(operation, outcome string, duration time.Duration) {
-	m.mu.Lock()
-	requestSeries := m.vendorRequests[vendorKey{operation: operation, outcome: outcome}]
-	if requestSeries == nil {
-		requestSeries = &series{}
-		m.vendorRequests[vendorKey{operation: operation, outcome: outcome}] = requestSeries
-	}
-	observeDuration(requestSeries, duration.Seconds())
-	m.mu.Unlock()
+	m.vendorRequests.WithLabelValues(operation, outcome).Inc()
+	m.vendorDuration.WithLabelValues(operation, outcome).Observe(duration.Seconds())
 }
 
 func (m *Metrics) VendorRetry(operation string) {
-	m.mu.Lock()
-	m.vendorRetries[operation]++
-	m.mu.Unlock()
+	m.vendorRetries.WithLabelValues(operation).Inc()
 }
 
 func (m *Metrics) StaleResponse() {
-	m.mu.Lock()
-	m.staleResponses++
-	m.mu.Unlock()
+	m.staleResponses.Inc()
 }
 
 func (m *Metrics) ResponseLogEnqueued(depth int) {
-	m.mu.Lock()
-	m.responseLogEnqueued++
-	m.responseLogQueueDepth = depth
-	m.mu.Unlock()
+	m.responseLogEnqueued.Inc()
+	m.responseLogQueueDepth.Set(float64(depth))
 }
 
 func (m *Metrics) ResponseLogDropped(depth int, reason string) {
@@ -121,60 +199,65 @@ func (m *Metrics) ResponseLogDropped(depth int, reason string) {
 	default:
 		reason = "other"
 	}
-	m.mu.Lock()
-	m.responseLogDropped++
-	m.responseLogDropReasons[reason]++
-	m.responseLogQueueDepth = depth
-	m.mu.Unlock()
+	m.responseLogDropped.Inc()
+	m.responseLogDropReasons.WithLabelValues(reason).Inc()
+	m.responseLogQueueDepth.Set(float64(depth))
 }
 
 func (m *Metrics) ResponseLogQueueDepth(depth int) {
-	m.mu.Lock()
-	m.responseLogQueueDepth = depth
-	m.mu.Unlock()
+	m.responseLogQueueDepth.Set(float64(depth))
 }
 
 func (m *Metrics) ResponseLogWrite(outcome string, duration time.Duration) {
-	m.mu.Lock()
-	m.responseLogWrites[outcome]++
-	observeDuration(&m.responseLogDurations, duration.Seconds())
-	m.mu.Unlock()
+	m.responseLogWrites.WithLabelValues(outcome).Inc()
+	m.responseLogDuration.Observe(duration.Seconds())
 }
 
 func (m *Metrics) ResponseLogRetry() {
-	m.mu.Lock()
-	m.responseLogRetries++
-	m.mu.Unlock()
+	m.responseLogRetries.Inc()
 }
 
 func (m *Metrics) DatabasePool(stats sql.DBStats) {
-	m.mu.Lock()
-	m.dbOpenConnections = stats.OpenConnections
-	m.dbInUseConnections = stats.InUse
-	m.dbIdleConnections = stats.Idle
-	m.dbWaitCount = stats.WaitCount
-	m.dbWaitDuration = stats.WaitDuration
-	m.mu.Unlock()
+	m.dbMu.Lock()
+	m.dbStats = stats
+	m.dbMu.Unlock()
 }
 
 func (m *Metrics) RetentionDeleted(count int) {
 	if count <= 0 {
 		return
 	}
-	m.mu.Lock()
-	m.retentionDeleted += uint64(count)
-	m.mu.Unlock()
+	m.retentionDeleted.Add(float64(count))
 }
 
-func observeDuration(requestSeries *series, duration float64) {
-	requestSeries.count++
-	requestSeries.durationSum += duration
-	for index, bucket := range histogramBuckets {
-		if duration <= bucket {
-			requestSeries.bucketCounts[index]++
+func (m *Metrics) registerDatabasePool(f promauto.Factory) {
+	read := func(value func(sql.DBStats) float64) func() float64 {
+		return func() float64 {
+			m.dbMu.Lock()
+			defer m.dbMu.Unlock()
+			return value(m.dbStats)
 		}
 	}
-	requestSeries.infCount++
+	f.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "weatherlookup_database_open_connections",
+		Help: "Current open database connections.",
+	}, read(func(s sql.DBStats) float64 { return float64(s.OpenConnections) }))
+	f.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "weatherlookup_database_in_use_connections",
+		Help: "Current in-use database connections.",
+	}, read(func(s sql.DBStats) float64 { return float64(s.InUse) }))
+	f.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "weatherlookup_database_idle_connections",
+		Help: "Current idle database connections.",
+	}, read(func(s sql.DBStats) float64 { return float64(s.Idle) }))
+	f.NewCounterFunc(prometheus.CounterOpts{
+		Name: "weatherlookup_database_wait_count_total",
+		Help: "Database connection wait count.",
+	}, read(func(s sql.DBStats) float64 { return float64(s.WaitCount) }))
+	f.NewCounterFunc(prometheus.CounterOpts{
+		Name: "weatherlookup_database_wait_duration_seconds_total",
+		Help: "Database connection wait duration.",
+	}, read(func(s sql.DBStats) float64 { return s.WaitDuration.Seconds() }))
 }
 
 // Middleware records all routes except /metrics itself, preventing scrapes
@@ -187,9 +270,8 @@ func (m *Metrics) Middleware(next http.Handler) http.Handler {
 		}
 
 		started := time.Now()
-		m.mu.Lock()
-		m.inFlight++
-		m.mu.Unlock()
+		m.httpInFlight.Inc()
+		defer m.httpInFlight.Dec()
 
 		recorder := &responseRecorder{ResponseWriter: response, status: http.StatusOK}
 		next.ServeHTTP(recorder, request)
@@ -202,24 +284,9 @@ func (m *Metrics) Middleware(next http.Handler) http.Handler {
 			path = "unmatched"
 		}
 
-		m.mu.Lock()
-		m.inFlight--
-		requestKey := key{method: methodLabel(request.Method), path: path, status: recorder.status}
-		requestSeries := m.requests[requestKey]
-		if requestSeries == nil {
-			requestSeries = &series{}
-			m.requests[requestKey] = requestSeries
-		}
-		requestSeries.count++
-		duration := time.Since(started).Seconds()
-		requestSeries.durationSum += duration
-		for index, bucket := range histogramBuckets {
-			if duration <= bucket {
-				requestSeries.bucketCounts[index]++
-			}
-		}
-		requestSeries.infCount++
-		m.mu.Unlock()
+		labels := []string{methodLabel(request.Method), path, strconv.Itoa(recorder.status)}
+		m.httpRequests.WithLabelValues(labels...).Inc()
+		m.httpDuration.WithLabelValues(labels...).Observe(time.Since(started).Seconds())
 	})
 }
 
@@ -243,200 +310,8 @@ func methodLabel(method string) string {
 	}
 }
 
-func (m *Metrics) ServeHTTP(response http.ResponseWriter, _ *http.Request) {
-	response.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	response.WriteHeader(http.StatusOK)
-
-	m.mu.Lock()
-	keys := make([]key, 0, len(m.requests))
-	for requestKey := range m.requests {
-		keys = append(keys, requestKey)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].path != keys[j].path {
-			return keys[i].path < keys[j].path
-		}
-		if keys[i].method != keys[j].method {
-			return keys[i].method < keys[j].method
-		}
-		return keys[i].status < keys[j].status
-	})
-	seriesByKey := make(map[key]series, len(keys))
-	for _, requestKey := range keys {
-		seriesByKey[requestKey] = *m.requests[requestKey]
-	}
-	inFlight := m.inFlight
-	m.mu.Unlock()
-
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_http_requests_total Total HTTP requests handled by the service.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_http_requests_total counter")
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_http_request_duration_seconds HTTP request duration in seconds.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_http_request_duration_seconds histogram")
-	for _, requestKey := range keys {
-		requestSeries := seriesByKey[requestKey]
-		labels := labelsFor(requestKey)
-		_, _ = fmt.Fprintf(response, "weatherlookup_http_requests_total%s %d\n", labels, requestSeries.count)
-		for index, bucket := range histogramBuckets {
-			bucketLabels := labelsWithExtra(requestKey, "le", strconv.FormatFloat(bucket, 'g', -1, 64))
-			_, _ = fmt.Fprintf(response, "weatherlookup_http_request_duration_seconds_bucket%s %d\n", bucketLabels, requestSeries.bucketCounts[index])
-		}
-		infLabels := labelsWithExtra(requestKey, "le", "+Inf")
-		_, _ = fmt.Fprintf(response, "weatherlookup_http_request_duration_seconds_bucket%s %d\n", infLabels, requestSeries.infCount)
-		_, _ = fmt.Fprintf(response, "weatherlookup_http_request_duration_seconds_sum%s %s\n", labels, strconv.FormatFloat(requestSeries.durationSum, 'g', -1, 64))
-		_, _ = fmt.Fprintf(response, "weatherlookup_http_request_duration_seconds_count%s %d\n", labels, requestSeries.count)
-	}
-
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_http_in_flight_requests Current number of HTTP requests being handled.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_http_in_flight_requests gauge")
-	_, _ = fmt.Fprintf(response, "weatherlookup_http_in_flight_requests %d\n", inFlight)
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_build_info Build information for the Weather Lookup service.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_build_info gauge")
-	_, _ = fmt.Fprintln(response, `weatherlookup_build_info{version="1.0.0"} 1`)
-	m.writeGuards(response)
-
-	m.mu.Lock()
-	cacheLookups := cloneCounters(m.cacheLookups)
-	cacheEntries := m.cacheEntries
-	cacheEvictions := m.cacheEvictions
-	staleResponses := m.staleResponses
-	vendorRequests := cloneSeriesMap(m.vendorRequests)
-	vendorRetries := cloneCounters(m.vendorRetries)
-	responseLogEnqueued := m.responseLogEnqueued
-	responseLogDropped := m.responseLogDropped
-	responseLogDropReasons := cloneCounters(m.responseLogDropReasons)
-	responseLogWrites := cloneCounters(m.responseLogWrites)
-	responseLogDurations := m.responseLogDurations
-	responseLogRetries := m.responseLogRetries
-	responseLogQueueDepth := m.responseLogQueueDepth
-	dbOpenConnections := m.dbOpenConnections
-	dbInUseConnections := m.dbInUseConnections
-	dbIdleConnections := m.dbIdleConnections
-	dbWaitCount := m.dbWaitCount
-	dbWaitDuration := m.dbWaitDuration
-	retentionDeleted := m.retentionDeleted
-	m.mu.Unlock()
-
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_cache_requests_total Cache lookups by result.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_cache_requests_total counter")
-	for result, count := range cacheLookups {
-		_, _ = fmt.Fprintf(response, "weatherlookup_cache_requests_total{result=\"%s\"} %d\n", escape(result), count)
-	}
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_cache_entries Current cache entries.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_cache_entries gauge")
-	_, _ = fmt.Fprintf(response, "weatherlookup_cache_entries %d\n", cacheEntries)
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_cache_evictions_total Cache entries evicted or expired.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_cache_evictions_total counter")
-	_, _ = fmt.Fprintf(response, "weatherlookup_cache_evictions_total %d\n", cacheEvictions)
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_stale_responses_total Responses served from expired cache entries.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_stale_responses_total counter")
-	_, _ = fmt.Fprintf(response, "weatherlookup_stale_responses_total %d\n", staleResponses)
-
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_vendor_requests_total Vendor requests by operation and outcome.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_vendor_requests_total counter")
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_vendor_request_duration_seconds Vendor request duration.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_vendor_request_duration_seconds histogram")
-	for requestKey, requestSeries := range vendorRequests {
-		writeLabeledHistogram(response, "weatherlookup_vendor_request_duration_seconds", fmt.Sprintf(`{operation="%s",outcome="%s"}`, escape(requestKey.operation), escape(requestKey.outcome)), requestSeries)
-		_, _ = fmt.Fprintf(response, "weatherlookup_vendor_requests_total{operation=\"%s\",outcome=\"%s\"} %d\n", escape(requestKey.operation), escape(requestKey.outcome), requestSeries.count)
-	}
-
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_vendor_retries_total Vendor retry attempts.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_vendor_retries_total counter")
-	for operation, count := range vendorRetries {
-		_, _ = fmt.Fprintf(response, "weatherlookup_vendor_retries_total{operation=\"%s\"} %d\n", escape(operation), count)
-	}
-
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_response_log_enqueued_total Response records queued for persistence.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_response_log_enqueued_total counter")
-	_, _ = fmt.Fprintf(response, "weatherlookup_response_log_enqueued_total %d\n", responseLogEnqueued)
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_response_log_dropped_total Response records lost to queue overflow or database failure.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_response_log_dropped_total counter")
-	_, _ = fmt.Fprintf(response, "weatherlookup_response_log_dropped_total %d\n", responseLogDropped)
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_response_log_dropped_by_reason_total Lost response records by bounded reason.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_response_log_dropped_by_reason_total counter")
-	for reason, count := range responseLogDropReasons {
-		_, _ = fmt.Fprintf(response, "weatherlookup_response_log_dropped_by_reason_total{reason=\"%s\"} %d\n", reason, count)
-	}
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_response_log_queue_depth Current response persistence queue depth.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_response_log_queue_depth gauge")
-	_, _ = fmt.Fprintf(response, "weatherlookup_response_log_queue_depth %d\n", responseLogQueueDepth)
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_response_log_writes_total Response persistence attempts by outcome.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_response_log_writes_total counter")
-	for outcome, count := range responseLogWrites {
-		_, _ = fmt.Fprintf(response, "weatherlookup_response_log_writes_total{outcome=\"%s\"} %d\n", escape(outcome), count)
-	}
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_response_log_retries_total Response persistence retry attempts.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_response_log_retries_total counter")
-	_, _ = fmt.Fprintf(response, "weatherlookup_response_log_retries_total %d\n", responseLogRetries)
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_response_log_write_duration_seconds Response persistence duration.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_response_log_write_duration_seconds histogram")
-	writeLabeledHistogram(response, "weatherlookup_response_log_write_duration_seconds", "", responseLogDurations)
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_retention_deleted_total Response records removed by retention cleanup.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_retention_deleted_total counter")
-	_, _ = fmt.Fprintf(response, "weatherlookup_retention_deleted_total %d\n", retentionDeleted)
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_database_open_connections Current open database connections.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_database_open_connections gauge")
-	_, _ = fmt.Fprintf(response, "weatherlookup_database_open_connections %d\n", dbOpenConnections)
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_database_in_use_connections Current in-use database connections.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_database_in_use_connections gauge")
-	_, _ = fmt.Fprintf(response, "weatherlookup_database_in_use_connections %d\n", dbInUseConnections)
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_database_idle_connections Current idle database connections.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_database_idle_connections gauge")
-	_, _ = fmt.Fprintf(response, "weatherlookup_database_idle_connections %d\n", dbIdleConnections)
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_database_wait_count_total Database connection wait count.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_database_wait_count_total counter")
-	_, _ = fmt.Fprintf(response, "weatherlookup_database_wait_count_total %d\n", dbWaitCount)
-	_, _ = fmt.Fprintln(response, "# HELP weatherlookup_database_wait_duration_seconds_total Database connection wait duration.")
-	_, _ = fmt.Fprintln(response, "# TYPE weatherlookup_database_wait_duration_seconds_total counter")
-	_, _ = fmt.Fprintf(response, "weatherlookup_database_wait_duration_seconds_total %s\n", strconv.FormatFloat(dbWaitDuration.Seconds(), 'g', -1, 64))
-}
-
-func cloneCounters(source map[string]uint64) map[string]uint64 {
-	clone := make(map[string]uint64, len(source))
-	for key, value := range source {
-		clone[key] = value
-	}
-	return clone
-}
-
-func cloneSeriesMap(source map[vendorKey]*series) map[vendorKey]series {
-	clone := make(map[vendorKey]series, len(source))
-	for key, value := range source {
-		clone[key] = *value
-	}
-	return clone
-}
-
-func writeLabeledHistogram(response http.ResponseWriter, name, labels string, requestSeries series) {
-	for index, bucket := range histogramBuckets {
-		_, _ = fmt.Fprintf(response, "%s_bucket%s %d\n", name, histogramLabels(labels, strconv.FormatFloat(bucket, 'g', -1, 64)), requestSeries.bucketCounts[index])
-	}
-	_, _ = fmt.Fprintf(response, "%s_bucket%s %d\n", name, histogramLabels(labels, "+Inf"), requestSeries.infCount)
-	_, _ = fmt.Fprintf(response, "%s_sum%s %s\n", name, labels, strconv.FormatFloat(requestSeries.durationSum, 'g', -1, 64))
-	_, _ = fmt.Fprintf(response, "%s_count%s %d\n", name, labels, requestSeries.count)
-}
-
-func histogramLabels(labels, valueText string) string {
-	if labels == "" {
-		return fmt.Sprintf(`{le="%s"}`, valueText)
-	}
-	return strings.TrimSuffix(labels, "}") + fmt.Sprintf(`,le="%s"}`, valueText)
-}
-
-func labelsFor(requestKey key) string {
-	return fmt.Sprintf(`{method="%s",path="%s",status="%d"}`,
-		escape(requestKey.method), escape(requestKey.path), requestKey.status)
-}
-
-func labelsWithExtra(requestKey key, name, value string) string {
-	labels := labelsFor(requestKey)
-	return "{" + strings.TrimSuffix(strings.TrimPrefix(labels, "{"), "}") + "," + name + `="` + escape(value) + `"}`
-}
-
-func escape(value string) string {
-	value = strings.ReplaceAll(value, `\`, `\\`)
-	value = strings.ReplaceAll(value, `"`, `\"`)
-	return strings.ReplaceAll(value, "\n", `\n`)
+func (m *Metrics) ServeHTTP(response http.ResponseWriter, request *http.Request) {
+	m.handler.ServeHTTP(response, request)
 }
 
 type responseRecorder struct {
