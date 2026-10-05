@@ -1,0 +1,12 @@
+# Build output
+/weatherlookup
+*.test
+coverage.out
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Local env files
+.env*
