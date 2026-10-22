@@ -22,6 +22,15 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		os.Exit(1)
+	}
+}
+
+// run wires up the service and blocks until it stops. Deferred cleanup
+// (persistence queue drain, tracer flush, signal-notify stop) always runs
+// before run returns, so main can os.Exit only after they have completed.
+func run() error {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	port := envOrDefault("PORT", "8080")
@@ -35,6 +44,7 @@ func main() {
 	vendorMaxAttempts := intOrDefault("VENDOR_MAX_ATTEMPTS", 2)
 	openMeteoBaseURL := envOrDefault("OPEN_METEO_BASE_URL", "https://api.open-meteo.com")
 	openMeteoGeocodingBaseURL := envOrDefault("OPEN_METEO_GEOCODING_BASE_URL", "https://geocoding-api.open-meteo.com")
+
 	traceEndpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 	serviceName := envOrDefault("OTEL_SERVICE_NAME", "weatherlookup")
 
@@ -134,16 +144,18 @@ func main() {
 	case err := <-serverErrors:
 		if !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("server stopped unexpectedly", "error", err)
-			os.Exit(1)
+			return err
 		}
 	case <-shutdownContext.Done():
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdown); err != nil {
 			logger.Error("graceful shutdown failed", "error", err)
-			os.Exit(1)
+			return err
 		}
 	}
+
+	return nil
 }
 
 func envOrDefault(key, fallback string) string {
