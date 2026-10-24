@@ -175,11 +175,14 @@ func writeServiceError(response http.ResponseWriter, err error) {
 
 	var vendorError *openmeteo.HTTPError
 	if errors.As(err, &vendorError) {
-		status := http.StatusBadGateway
-		if vendorError.StatusCode == http.StatusTooManyRequests || vendorError.StatusCode >= http.StatusInternalServerError {
-			status = http.StatusBadGateway
+		if vendorError.StatusCode == http.StatusTooManyRequests {
+			// Upstream throttling is retryable: 503 (not 502) plus
+			// Retry-After, matching the vendor-busy path above.
+			response.Header().Set("Retry-After", "1")
+			writeError(response, http.StatusServiceUnavailable, "weather provider is rate limited; retry later")
+			return
 		}
-		writeError(response, status, "weather provider request failed")
+		writeError(response, http.StatusBadGateway, "weather provider request failed")
 		return
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {

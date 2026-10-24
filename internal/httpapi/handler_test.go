@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"weatherlookup/internal/cache"
+	"weatherlookup/internal/openmeteo"
 	"weatherlookup/internal/response"
 	"weatherlookup/internal/weather"
 )
@@ -145,5 +146,29 @@ func TestHandlerEnqueuesResponseRecord(t *testing.T) {
 	record := sink.records[0]
 	if !record.SpanContext.Equal(sc) || record.TraceID != traceID.String() || record.SpanID != spanID.String() {
 		t.Fatalf("response record lost trace identity, sampling flags, or trace state: %+v", record)
+	}
+}
+
+func TestWriteServiceErrorMapsUpstreamRateLimitToServiceUnavailable(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantRetry  string
+	}{
+		{name: "upstream 429", err: &openmeteo.HTTPError{StatusCode: http.StatusTooManyRequests, Message: "Too Many Requests"}, wantStatus: http.StatusServiceUnavailable, wantRetry: "1"},
+		{name: "upstream 500 stays 502", err: &openmeteo.HTTPError{StatusCode: http.StatusInternalServerError, Message: "Internal Server Error"}, wantStatus: http.StatusBadGateway, wantRetry: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			writeServiceError(response, test.err)
+			if response.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", response.Code, test.wantStatus)
+			}
+			if got := response.Header().Get("Retry-After"); got != test.wantRetry {
+				t.Fatalf("Retry-After = %q, want %q", got, test.wantRetry)
+			}
+		})
 	}
 }
